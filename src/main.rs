@@ -1,8 +1,11 @@
 //! Spike: prouver qu'on peut capturer une region de l'ecran pendant qu'un jeu
 //! tourne en plein ecran exclusif, via Windows.Graphics.Capture.
 
+use std::io::Write;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
+use std::time::Duration;
 
 use clap::Parser;
 use parking_lot::Mutex;
@@ -33,6 +36,9 @@ struct Args {
     /// Fichier PNG de sortie
     #[arg(long, default_value = "capture.png")]
     out: String,
+    /// Delai avant la capture, en secondes (le temps de basculer sur le jeu)
+    #[arg(long, default_value_t = 0)]
+    delay: u64,
 }
 
 /// Region a capturer, en pixels, dans le repere de la frame.
@@ -215,6 +221,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         rect.y + rect.h
     );
 
+    if args.delay > 0 {
+        countdown(args.delay);
+    }
+
     let result = Arc::new(Mutex::new(None));
     let settings = Settings::new(
         monitor,
@@ -262,6 +272,20 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+/// Compte a rebours sur une seule ligne, pour laisser le temps de basculer sur le jeu.
+fn countdown(secs: u64) {
+    println!("Capture dans {secs}s - bascule sur le jeu maintenant.");
+    for remaining in (1..=secs).rev() {
+        print!("\r  {remaining:>3}s ");
+        let _ = std::io::stdout().flush();
+        thread::sleep(Duration::from_secs(1));
+    }
+    // La ligne du compte a rebours est reecrite pour ne pas polluer la sortie finale.
+    print!("\r        \r");
+    let _ = std::io::stdout().flush();
+    println!("Capture...");
 }
 
 /// Traduit les erreurs de la pile WGC en messages exploitables.
