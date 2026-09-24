@@ -9,6 +9,7 @@ use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -79,6 +80,14 @@ enum Cmd {
         /// Mesure une seule fois sur ce PNG au lieu de capturer l'ecran
         #[arg(long)]
         from: Option<PathBuf>,
+        /// Enregistre les images autour de chaque passage du score sous
+        /// --dump-threshold (frame de transition + 5 suivantes), region et
+        /// ecran entier. Le dossier est cree s'il n'existe pas.
+        #[arg(long)]
+        dump_transitions: Option<PathBuf>,
+        /// Seuil de declenchement de --dump-transitions
+        #[arg(long, default_value_t = 0.45)]
+        dump_threshold: f64,
     },
 }
 
@@ -248,6 +257,17 @@ fn crop_rgba(img: &image::RgbaImage, r: Rect) -> Vec<u8> {
     image::imageops::crop_imm(img, r.x, r.y, r.w, r.h).to_image().into_raw()
 }
 
+/// Decoupe `r` dans un buffer RGBA8 brut de largeur `sw`.
+fn crop_raw(rgba: &[u8], sw: u32, r: Rect) -> Vec<u8> {
+    let stride = sw as usize * 4;
+    let (x0, row) = (r.x as usize * 4, r.w as usize * 4);
+    let mut out = Vec::with_capacity(row * r.h as usize);
+    for y in r.y as usize..(r.y + r.h) as usize {
+        out.extend_from_slice(&rgba[y * stride + x0..y * stride + x0 + row]);
+    }
+    out
+}
+
 /// Moyenne, ecart-type et maximum de la luminosite (Rec. 601) sur du RGBA8.
 fn luminance_stats(pixels: &[u8]) -> (f64, f64, u8) {
     let mut sum = 0.0f64;
@@ -391,6 +411,9 @@ fn check_fits(tpl: &Template, g: &Geometry) -> Result<(), BoxError> {
 struct Grab {
     geom: Geometry,
     rgba: Vec<u8>,
+    /// Surface entiere (RGBA8, geom.surface_w x geom.surface_h), seulement
+    /// si Flags::keep_full.
+    full: Option<Arc<Vec<u8>>>,
     /// Numero de frame WGC (WGC n'envoie une frame que si l'ecran change).
     seq: u64,
 }
@@ -399,6 +422,8 @@ struct Flags {
     spec: RegionSpec,
     /// Arrete la capture apres la premiere frame.
     once: bool,
+    /// Conserve aussi la surface entiere (pour --dump-transitions).
+    keep_full: bool,
     latest: Arc<Mutex<Option<Grab>>>,
 }
 
@@ -436,11 +461,19 @@ impl GraphicsCaptureApiHandler for Grabber {
         self.geom = Some(geom);
 
         let r = geom.region;
-        let buffer = frame.buffer_crop(r.x, r.y, r.x + r.w, r.y + r.h)?;
         let mut scratch = Vec::new();
-        let rgba = buffer.as_nopadding_buffer(&mut scratch).to_vec();
+        let (rgba, full) = if self.flags.keep_full {
+            // Une seule relecture GPU de la surface entiere, la region en est
+            // decoupee cote CPU.
+            let buffer = frame.buffer()?;
+            let full = buffer.as_nopadding_buffer(&mut scratch).to_vec();
+            (crop_raw(&full, fw, r), Some(Arc::new(full)))
+        } else {
+            let buffer = frame.buffer_crop(r.x, r.y, r.x + r.w, r.y + r.h)?;
+            (buffer.as_nopadding_buffer(&mut scratch).to_vec(), None)
+        };
 
-        *self.flags.latest.lock() = Some(Grab { geom, rgba, seq: self.seq });
+        *self.flags.latest.lock() = Some(Grab { geom, rgba, full, seq: self.seq });
 
         if self.flags.once {
             control.stop();
@@ -509,7 +542,7 @@ fn settings<T: TryInto<GraphicsCaptureItemType>>(item: T, flags: Flags) -> Setti
 /// Capture une seule frame (bloquant).
 fn capture_once(target: Target, spec: RegionSpec) -> Result<Grab, BoxError> {
     let latest = Arc::new(Mutex::new(None));
-    let flags = Flags { spec, once: true, latest: latest.clone() };
+    let flags = Flags { spec, once: true, keep_full: false, latest: latest.clone() };
     match target {
         Target::Monitor(m) => Grabber::start(settings(m, flags)),
         Target::Window(w) => Grabber::start(settings(w, flags)),
@@ -523,9 +556,10 @@ fn capture_once(target: Target, spec: RegionSpec) -> Result<Grab, BoxError> {
 fn capture_start(
     target: Target,
     spec: RegionSpec,
+    keep_full: bool,
     latest: Arc<Mutex<Option<Grab>>>,
 ) -> Result<CaptureControl<Grabber, BoxError>, BoxError> {
-    let flags = Flags { spec, once: false, latest };
+    let flags = Flags { spec, once: false, keep_full, latest };
     Ok(match target {
         Target::Monitor(m) => Grabber::start_free_threaded(settings(m, flags)),
         Target::Window(w) => Grabber::start_free_threaded(settings(w, flags)),
@@ -649,13 +683,13 @@ impl Csv {
 /// Une ligne de mesure, affichee et eventuellement ecrite en CSV.
 fn report(
     csv: &mut Option<Csv>,
+    unix_ms: u128,
     t: f64,
     frame: u64,
     m: &Match,
     geom: &Geometry,
     compute: Duration,
 ) -> Result<(), BoxError> {
-    let unix_ms = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
     let (ax, ay) = (geom.region.x + m.x, geom.region.y + m.y);
     let ms = compute.as_secs_f64() * 1000.0;
     println!(
@@ -666,6 +700,83 @@ fn report(
         writeln!(w, "{unix_ms},{t:.3},{frame},{:.6},{},{},{ax},{ay},{ms:.3}", m.score, m.x, m.y)?;
         w.flush()?;
     }
+    Ok(())
+}
+
+fn unix_ms_now() -> u128 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0)
+}
+
+/// Frames enregistrees par declenchement: la transition + 5 suivantes.
+const DUMP_FRAMES: u32 = 6;
+
+struct DumpJob {
+    unix_ms: u128,
+    zone: Rect,
+    rgba: Vec<u8>,
+    surface: (u32, u32),
+    full: Arc<Vec<u8>>,
+}
+
+/// Ecrit les PNG de --dump-transitions sur un thread a part, pour que
+/// l'encodage (plusieurs dizaines de ms pour un ecran entier) ne decale pas
+/// la cadence de mesure.
+struct Dumper {
+    tx: Option<mpsc::Sender<DumpJob>>,
+    worker: Option<thread::JoinHandle<()>>,
+}
+
+impl Dumper {
+    fn start(dir: &Path) -> Result<Self, BoxError> {
+        std::fs::create_dir_all(dir).map_err(|e| format!("creation de {} impossible: {e}", dir.display()))?;
+        let dir = dir.to_path_buf();
+        let (tx, rx) = mpsc::channel::<DumpJob>();
+        let worker = thread::spawn(move || {
+            for job in rx {
+                let zone = dir.join(format!("{}_zone.png", job.unix_ms));
+                let full = dir.join(format!("{}_full.png", job.unix_ms));
+                let (sw, sh) = job.surface;
+                for (path, w, h, px) in
+                    [(&zone, job.zone.w, job.zone.h, &job.rgba[..]), (&full, sw, sh, &job.full[..])]
+                {
+                    if let Err(e) = write_png(path, w, h, px) {
+                        eprintln!("ERREUR dump {}: {e}", path.display());
+                    }
+                }
+            }
+        });
+        Ok(Self { tx: Some(tx), worker: Some(worker) })
+    }
+
+    fn push(&self, job: DumpJob) {
+        if let Some(tx) = &self.tx {
+            // Le thread d'ecriture ne s'arrete qu'a la fermeture du canal.
+            let _ = tx.send(job);
+        }
+    }
+
+    /// Ferme le canal et attend l'ecriture des PNG encore en file.
+    fn finish(mut self) {
+        drop(self.tx.take());
+        if let Some(w) = self.worker.take() {
+            println!("Ecriture des PNG en attente...");
+            let _ = w.join();
+        }
+    }
+}
+
+/// PNG RGBA8 en compression rapide (l'ecran entier est gros).
+fn write_png(path: &Path, w: u32, h: u32, rgba: &[u8]) -> Result<(), BoxError> {
+    use image::ImageEncoder;
+    use image::codecs::png::{CompressionType, FilterType, PngEncoder};
+
+    let f = BufWriter::new(File::create(path)?);
+    PngEncoder::new_with_quality(f, CompressionType::Fast, FilterType::Adaptive).write_image(
+        rgba,
+        w,
+        h,
+        image::ExtendedColorType::Rgba8,
+    )?;
     Ok(())
 }
 
@@ -682,9 +793,14 @@ fn cmd_watch(
     hz: f64,
     log: Option<&Path>,
     from: Option<&Path>,
+    dump_dir: Option<&Path>,
+    dump_threshold: f64,
 ) -> Result<(), BoxError> {
     if !(hz > 0.0 && hz <= 1000.0) {
         return Err(format!("--hz doit etre dans ]0, 1000] (recu {hz})").into());
+    }
+    if !dump_threshold.is_finite() {
+        return Err(format!("--dump-threshold invalide (recu {dump_threshold})").into());
     }
     let tpl_rgba = load_rgba(template)?;
     let tpl = Template::new(&rgba_to_gray(tpl_rgba.width(), tpl_rgba.height(), tpl_rgba.as_raw()))?;
@@ -695,9 +811,21 @@ fn cmd_watch(
     if let Some(path) = from {
         let (geom, rgba) = grab_region(region, Some(path), 0)?;
         check_fits(&tpl, &geom)?;
+        if dump_dir.is_some() {
+            println!("Note: --dump-transitions ignore avec --from (une seule mesure, pas de transition)");
+        }
         let (m, compute) = measure(&tpl, &geom, &rgba);
-        report(&mut csv, 0.0, 0, &m, &geom, compute)?;
+        report(&mut csv, unix_ms_now(), 0.0, 0, &m, &geom, compute)?;
         return Ok(());
+    }
+
+    let dumper = dump_dir.map(Dumper::start).transpose()?;
+    if let Some(dir) = dump_dir {
+        println!(
+            "Dump des transitions: score < {dump_threshold} apres une frame >= {dump_threshold}, \
+             {DUMP_FRAMES} frames -> {}",
+            dir.display()
+        );
     }
 
     let stop = Arc::new(AtomicBool::new(false));
@@ -708,7 +836,7 @@ fn cmd_watch(
 
     let target = resolve_target(region.window.as_deref())?;
     let latest = Arc::new(Mutex::new(None));
-    let control = capture_start(target, RegionSpec::from(region), latest.clone())?;
+    let control = capture_start(target, RegionSpec::from(region), dumper.is_some(), latest.clone())?;
     println!("Mesure a {hz} Hz. Ctrl-C pour sortir.");
 
     let period = Duration::from_secs_f64(1.0 / hz);
@@ -717,6 +845,9 @@ fn cmd_watch(
     let mut current: Option<Grab> = None;
     let mut shown_geom: Option<Geometry> = None;
     let (mut total, mut count) = (Duration::ZERO, 0u32);
+    let mut prev_score: Option<f64> = None;
+    // Frames restant a enregistrer pour le dernier declenchement.
+    let mut dump_left = 0u32;
     let mut result = Ok(());
 
     while !stop.load(Ordering::SeqCst) {
@@ -738,10 +869,39 @@ fn cmd_watch(
             let (m, compute) = measure(&tpl, &g.geom, &g.rgba);
             total += compute;
             count += 1;
-            if let Err(e) = report(&mut csv, t0.elapsed().as_secs_f64(), g.seq, &m, &g.geom, compute) {
+            let unix_ms = unix_ms_now();
+            let t = t0.elapsed().as_secs_f64();
+            if let Err(e) = report(&mut csv, unix_ms, t, g.seq, &m, &g.geom, compute) {
                 result = Err(e);
                 break;
             }
+
+            if let Some(d) = &dumper {
+                if let Some(prev) = prev_score
+                    && prev >= dump_threshold
+                    && m.score < dump_threshold
+                {
+                    println!(
+                        ">>> TRANSITION unix_ms={unix_ms} t={t:.3}s score={:+.4} (precedent {prev:+.4}) \
+                         -> dump de {DUMP_FRAMES} frames",
+                        m.score
+                    );
+                    dump_left = DUMP_FRAMES;
+                }
+                if dump_left > 0 {
+                    dump_left -= 1;
+                    if let Some(full) = &g.full {
+                        d.push(DumpJob {
+                            unix_ms,
+                            zone: g.geom.region,
+                            rgba: g.rgba.clone(),
+                            surface: (g.geom.surface_w, g.geom.surface_h),
+                            full: full.clone(),
+                        });
+                    }
+                }
+            }
+            prev_score = Some(m.score);
         }
 
         next += period;
@@ -763,11 +923,15 @@ fn cmd_watch(
         println!("Aucune frame recue.");
     }
 
-    if control.is_finished() {
-        control.wait().map_err(|e| format!("la capture s'est arretee: {e}"))?;
+    let stopped = if control.is_finished() {
+        control.wait().map_err(|e| format!("la capture s'est arretee: {e}"))
     } else {
-        control.stop().map_err(|e| format!("arret de la capture: {e}"))?;
+        control.stop().map_err(|e| format!("arret de la capture: {e}"))
+    };
+    if let Some(d) = dumper {
+        d.finish();
     }
+    stopped?;
     result
 }
 
@@ -792,9 +956,17 @@ fn run() -> Result<(), BoxError> {
             region.validate()?;
             cmd_extract(region, out, from.as_deref(), *delay)
         }
-        Cmd::Watch { region, template, hz, log, from } => {
+        Cmd::Watch { region, template, hz, log, from, dump_transitions, dump_threshold } => {
             region.validate()?;
-            cmd_watch(region, template, *hz, log.as_deref(), from.as_deref())
+            cmd_watch(
+                region,
+                template,
+                *hz,
+                log.as_deref(),
+                from.as_deref(),
+                dump_transitions.as_deref(),
+                *dump_threshold,
+            )
         }
     }
 }
