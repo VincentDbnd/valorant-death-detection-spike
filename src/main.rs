@@ -108,10 +108,11 @@ struct RegionArgs {
     /// Applique les pourcentages a la surface brute (pas de recadrage 16:9)
     #[arg(long)]
     no_letterbox: bool,
-    /// Capture la fenetre dont le titre est donne (exact, sinon sous-chaine)
-    /// au lieu du moniteur principal
-    #[arg(long)]
-    window: Option<String>,
+    /// Capture la fenetre dont le titre contient ce texte (sans tenir compte
+    /// de la casse ni des espaces en bordure) au lieu du moniteur principal.
+    /// Les pourcentages et le letterbox s'appliquent alors a la fenetre.
+    #[arg(long, visible_alias = "window")]
+    game_window: Option<String>,
 }
 
 impl RegionArgs {
@@ -411,6 +412,10 @@ fn check_fits(tpl: &Template, g: &Geometry) -> Result<(), BoxError> {
 struct Grab {
     geom: Geometry,
     rgba: Vec<u8>,
+    /// Surface entiere (hors alpha) a zero partout.
+    black: bool,
+    /// Empreinte de la surface entiere, pour reperer une frame figee.
+    hash: u64,
     /// Surface entiere (RGBA8, geom.surface_w x geom.surface_h), seulement
     /// si Flags::keep_full.
     full: Option<Arc<Vec<u8>>>,
@@ -460,20 +465,16 @@ impl GraphicsCaptureApiHandler for Grabber {
         };
         self.geom = Some(geom);
 
-        let r = geom.region;
+        // Une seule relecture GPU de la surface entiere: elle sert au test
+        // noir / figee, et la region en est decoupee cote CPU.
         let mut scratch = Vec::new();
-        let (rgba, full) = if self.flags.keep_full {
-            // Une seule relecture GPU de la surface entiere, la region en est
-            // decoupee cote CPU.
-            let buffer = frame.buffer()?;
-            let full = buffer.as_nopadding_buffer(&mut scratch).to_vec();
-            (crop_raw(&full, fw, r), Some(Arc::new(full)))
-        } else {
-            let buffer = frame.buffer_crop(r.x, r.y, r.x + r.w, r.y + r.h)?;
-            (buffer.as_nopadding_buffer(&mut scratch).to_vec(), None)
-        };
+        let buffer = frame.buffer()?;
+        let surface = buffer.as_nopadding_buffer(&mut scratch);
+        let (black, hash) = surface_check(surface);
+        let rgba = crop_raw(surface, fw, geom.region);
+        let full = self.flags.keep_full.then(|| Arc::new(surface.to_vec()));
 
-        *self.flags.latest.lock() = Some(Grab { geom, rgba, full, seq: self.seq });
+        *self.flags.latest.lock() = Some(Grab { geom, rgba, black, hash, full, seq: self.seq });
 
         if self.flags.once {
             control.stop();
@@ -512,18 +513,100 @@ fn resolve_target(window: Option<&str>) -> Result<Target, BoxError> {
             println!("Source             : moniteur principal");
             Ok(Target::Monitor(m))
         }
-        Some(title) => {
-            let w = Window::from_name(title)
-                .or_else(|_| Window::from_contains_name(title))
-                .map_err(|e| format!("aucune fenetre ne correspond a {title:?} ({e})"))?;
-            println!(
-                "Source             : fenetre {:?} (processus {})",
-                w.title().unwrap_or_default(),
-                w.process_name().unwrap_or_else(|_| "?".into())
-            );
-            Ok(Target::Window(w))
+        Some(title) => Ok(Target::Window(find_window(title)?)),
+    }
+}
+
+/// Processus des terminaux: leur titre contient souvent la ligne de commande,
+/// donc le titre cherche lui-meme.
+const TERMINALS: [&str; 6] =
+    ["conhost.exe", "openconsole.exe", "windowsterminal.exe", "cmd.exe", "powershell.exe", "pwsh.exe"];
+
+/// Fenetre dont le titre contient `query`, sans tenir compte de la casse ni
+/// des espaces en bordure. Les fenetres de terminal sont ecartees; s'il reste
+/// plusieurs candidates, c'est une erreur plutot qu'un choix arbitraire.
+fn find_window(query: &str) -> Result<Window, BoxError> {
+    let needle = query.trim().to_lowercase();
+    if needle.is_empty() {
+        return Err("--game-window: titre vide".into());
+    }
+    let mut games = Vec::new();
+    let mut terminals = Vec::new();
+    for w in Window::enumerate().map_err(|e| format!("enumeration des fenetres impossible ({e})"))? {
+        let Ok(title) = w.title() else { continue };
+        if !title.trim().to_lowercase().contains(&needle) {
+            continue;
+        }
+        let process = w.process_name().unwrap_or_else(|_| "?".into());
+        if TERMINALS.contains(&process.to_lowercase().as_str()) {
+            terminals.push((title, process));
+        } else {
+            games.push((w, title, process));
         }
     }
+    for (title, process) in &terminals {
+        println!("Ignoree (terminal) : {title:?} ({process})");
+    }
+    match games.len() {
+        0 => Err(format!(
+            "aucune fenetre (hors terminal) dont le titre contient {query:?}. \
+             Le jeu est-il lance ? Capture non demarree."
+        )
+        .into()),
+        1 => {
+            let (w, title, process) = games.pop().unwrap();
+            let size = match (w.width(), w.height()) {
+                (Ok(ww), Ok(wh)) => format!("{ww}x{wh}"),
+                _ => "?".into(),
+            };
+            println!("Source             : fenetre {title:?} (processus {process})");
+            println!("Taille fenetre     : {size} (GetWindowRect, bordures comprises)");
+            Ok(w)
+        }
+        _ => {
+            let list: Vec<String> =
+                games.iter().map(|(_, t, p)| format!("  {t:?} ({p})")).collect();
+            Err(format!(
+                "plusieurs fenetres contiennent {query:?}, precise le titre:\n{}",
+                list.join("\n")
+            )
+            .into())
+        }
+    }
+}
+
+/// Parcourt la surface RGBA8 par mots de 64 bits (2 pixels): dit si tous les
+/// canaux RGB sont a zero, et calcule une empreinte 64 bits de tous les
+/// octets. Quatre accumulateurs independants pour tenir le debit sur un ecran
+/// entier a chaque frame.
+fn surface_check(px: &[u8]) -> (bool, u64) {
+    const RGB: u64 = 0x00FF_FFFF_00FF_FFFF;
+    const K: [u64; 4] =
+        [0x9E37_79B9_7F4A_7C15, 0xC2B2_AE3D_27D4_EB4F, 0x1656_67B1_9E37_79F9, 0x85EB_CA77_C2B2_AE63];
+    let word = |b: &[u8]| u64::from_le_bytes(b.try_into().unwrap());
+
+    let mut acc = [0u64; 4];
+    let mut or = 0u64;
+    let chunks = px.chunks_exact(32);
+    let tail = chunks.remainder();
+    for c in chunks {
+        for k in 0..4 {
+            let v = word(&c[k * 8..k * 8 + 8]);
+            or |= v;
+            acc[k] = (acc[k] ^ v).wrapping_mul(K[k]).rotate_left(29);
+        }
+    }
+    let mut h = px.len() as u64;
+    for (k, a) in acc.iter().enumerate() {
+        h = (h ^ a).wrapping_mul(K[k]).rotate_left(31);
+    }
+    for (i, &b) in tail.iter().enumerate() {
+        if i % 4 != 3 {
+            or |= u64::from(b);
+        }
+        h = (h ^ u64::from(b)).wrapping_mul(K[0]);
+    }
+    (or & RGB == 0, h)
 }
 
 fn settings<T: TryInto<GraphicsCaptureItemType>>(item: T, flags: Flags) -> Settings<Flags, T> {
@@ -610,8 +693,8 @@ fn grab_region(
     let spec = RegionSpec::from(region);
     match from {
         Some(path) => {
-            if region.window.is_some() {
-                println!("Note: --window ignore avec --from");
+            if region.game_window.is_some() {
+                println!("Note: --game-window ignore avec --from");
             }
             println!("Source             : fichier {}", path.display());
             let img = load_rgba(path)?;
@@ -620,7 +703,7 @@ fn grab_region(
             Ok((geom, crop_rgba(&img, geom.region)))
         }
         None => {
-            let target = resolve_target(region.window.as_deref())?;
+            let target = resolve_target(region.game_window.as_deref())?;
             if delay > 0 {
                 countdown(delay);
             }
@@ -675,9 +758,19 @@ impl Csv {
     fn create(path: &Path) -> Result<Self, BoxError> {
         let f = File::create(path).map_err(|e| format!("creation de {} impossible: {e}", path.display()))?;
         let mut w = BufWriter::new(f);
-        writeln!(w, "unix_ms,t_s,frame,score,x,y,abs_x,abs_y,compute_ms")?;
+        writeln!(w, "unix_ms,t_s,frame,score,x,y,abs_x,abs_y,compute_ms,foreground,capture_ok")?;
         Ok(Self(w))
     }
+}
+
+/// Etat de la source au moment d'une mesure. Instrumentation seule: rien
+/// n'est filtre ni gele d'apres ces valeurs.
+struct Status {
+    /// La fenetre active est celle du jeu. None sans --game-window.
+    foreground: Option<bool>,
+    /// false si la surface est noire ou identique a celle de la mesure
+    /// precedente.
+    capture_ok: bool,
 }
 
 /// Une ligne de mesure, affichee et eventuellement ecrite en CSV.
@@ -689,15 +782,23 @@ fn report(
     m: &Match,
     geom: &Geometry,
     compute: Duration,
+    st: &Status,
 ) -> Result<(), BoxError> {
     let (ax, ay) = (geom.region.x + m.x, geom.region.y + m.y);
     let ms = compute.as_secs_f64() * 1000.0;
+    // Colonne vide sans --game-window: pas de fenetre de reference.
+    let fg = st.foreground.map_or("", |f| if f { "1" } else { "0" });
+    let ok = u8::from(st.capture_ok);
     println!(
-        "t={t:9.3}s frame={frame:<6} score={:+.4} pos=({},{}) surface=({ax},{ay}) calcul={ms:.2}ms",
-        m.score, m.x, m.y
+        "t={t:9.3}s frame={frame:<6} score={:+.4} pos=({},{}) surface=({ax},{ay}) calcul={ms:.2}ms \
+         fg={} ok={ok}",
+        m.score,
+        m.x,
+        m.y,
+        if fg.is_empty() { "-" } else { fg }
     );
     if let Some(Csv(w)) = csv {
-        writeln!(w, "{unix_ms},{t:.3},{frame},{:.6},{},{},{ax},{ay},{ms:.3}", m.score, m.x, m.y)?;
+        writeln!(w, "{unix_ms},{t:.3},{frame},{:.6},{},{},{ax},{ay},{ms:.3},{fg},{ok}", m.score, m.x, m.y)?;
         w.flush()?;
     }
     Ok(())
@@ -814,8 +915,11 @@ fn cmd_watch(
         if dump_dir.is_some() {
             println!("Note: --dump-transitions ignore avec --from (une seule mesure, pas de transition)");
         }
+        // Pas de frame precedente: seul le test "noire" s'applique.
+        let (black, _) = surface_check(load_rgba(path)?.as_raw());
+        let st = Status { foreground: None, capture_ok: !black };
         let (m, compute) = measure(&tpl, &geom, &rgba);
-        report(&mut csv, unix_ms_now(), 0.0, 0, &m, &geom, compute)?;
+        report(&mut csv, unix_ms_now(), 0.0, 0, &m, &geom, compute, &st)?;
         return Ok(());
     }
 
@@ -834,7 +938,12 @@ fn cmd_watch(
         ctrlc::set_handler(move || stop.store(true, Ordering::SeqCst))?;
     }
 
-    let target = resolve_target(region.window.as_deref())?;
+    let target = resolve_target(region.game_window.as_deref())?;
+    // HWND du jeu, compare a la fenetre active a chaque mesure.
+    let game_hwnd = match &target {
+        Target::Window(w) => Some(w.as_raw_hwnd()),
+        Target::Monitor(_) => None,
+    };
     let latest = Arc::new(Mutex::new(None));
     let control = capture_start(target, RegionSpec::from(region), dumper.is_some(), latest.clone())?;
     println!("Mesure a {hz} Hz. Ctrl-C pour sortir.");
@@ -846,6 +955,8 @@ fn cmd_watch(
     let mut shown_geom: Option<Geometry> = None;
     let (mut total, mut count) = (Duration::ZERO, 0u32);
     let mut prev_score: Option<f64> = None;
+    // Empreinte de la surface mesuree precedemment.
+    let mut prev_hash: Option<u64> = None;
     // Frames restant a enregistrer pour le dernier declenchement.
     let mut dump_left = 0u32;
     let mut result = Ok(());
@@ -869,9 +980,16 @@ fn cmd_watch(
             let (m, compute) = measure(&tpl, &g.geom, &g.rgba);
             total += compute;
             count += 1;
+            // Sans nouvelle frame WGC depuis la mesure precedente, la meme
+            // surface est remesuree: elle compte comme figee.
+            let st = Status {
+                foreground: game_hwnd.map(|h| Window::foreground().is_ok_and(|f| f.as_raw_hwnd() == h)),
+                capture_ok: !g.black && prev_hash != Some(g.hash),
+            };
+            prev_hash = Some(g.hash);
             let unix_ms = unix_ms_now();
             let t = t0.elapsed().as_secs_f64();
-            if let Err(e) = report(&mut csv, unix_ms, t, g.seq, &m, &g.geom, compute) {
+            if let Err(e) = report(&mut csv, unix_ms, t, g.seq, &m, &g.geom, compute, &st) {
                 result = Err(e);
                 break;
             }
